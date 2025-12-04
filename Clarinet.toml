@@ -1,0 +1,28 @@
+[project]
+name = "real-estate-settlement"
+description = "Real Estate Settlement DApp with Stacks blockchain"
+authors = ["Real Estate Settlement Team"]
+telemetry = false
+cache_dir = ".clarinet"
+
+[contracts.real-estate-registry]
+path = "contracts/real-estate-registry.clar"
+
+[contracts.real-estate-escrow]
+path = "contracts/real-estate-escrow.clar"
+
+[contracts.real-estate-parcel]
+path = "contracts/real-estate-parcel.clar"
+
+[repl]
+costs_version = 2
+parser_version = 2
+
+[repl.analysis]
+passes = ["check_checker"]
+
+[[repl.analysis.check_checker.strict]]
+enabled = false
+
+[project.requirements]
+stacks_version = "2.4"

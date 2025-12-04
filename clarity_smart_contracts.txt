@@ -1,0 +1,626 @@
+;; =============================================================================
+;; REAL ESTATE PARCEL NFT TRAIT (SIP-009 Extension)
+;; =============================================================================
+
+(define-trait real-estate-parcel-trait
+  (
+    ;; Standard NFT functions (SIP-009 compatibility)
+    (get-last-token-id () (response uint uint))
+    (get-token-uri (uint) (response (optional (string-ascii 256)) uint))
+    (get-owner (uint) (response (optional principal) uint))
+    (transfer (uint principal principal) (response bool uint))
+    
+    ;; Real estate specific functions
+    (get-parcel-data (uint) (response (optional {
+      coordinates: {lat: int, lng: int},
+      parcel-id: (string-ascii 64),
+      legal-description: (string-ascii 512),
+      assessed-value: uint,
+      property-type: (string-ascii 32),
+      zoning: (string-ascii 16),
+      square-footage: uint,
+      creation-height: uint
+    }) uint))
+    
+    (update-parcel-data (uint {
+      coordinates: {lat: int, lng: int},
+      parcel-id: (string-ascii 64),
+      legal-description: (string-ascii 512),
+      assessed-value: uint,
+      property-type: (string-ascii 32),
+      zoning: (string-ascii 16),
+      square-footage: uint
+    }) (response bool uint))
+  )
+)
+
+;; =============================================================================
+;; REAL ESTATE REGISTRY CONTRACT
+;; =============================================================================
+
+(define-constant CONTRACT-OWNER tx-sender)
+(define-constant ERR-OWNER-ONLY (err u100))
+(define-constant ERR-NOT-FOUND (err u101))
+(define-constant ERR-ALREADY-EXISTS (err u102))
+(define-constant ERR-INVALID-CALLER (err u103))
+(define-constant ERR-ESCROW-ACTIVE (err u104))
+(define-constant ERR-UNAUTHORIZED (err u105))
+
+;; Data structures
+(define-map parcel-registry 
+  {property-id: (string-ascii 128)} 
+  {
+    escrow-contract: (optional principal),
+    status: (string-ascii 32),
+    owner: principal,
+    last-updated: uint,
+    coordinates: {lat: int, lng: int},
+    parcel-id: (string-ascii 64)
+  }
+)
+
+(define-map escrow-contracts
+  principal
+  {
+    property-id: (string-ascii 128),
+    buyer: principal,
+    seller: principal,
+    amount: uint,
+    status: (string-ascii 32),
+    creation-height: uint,
+    expiry-height: uint
+  }
+)
+
+(define-data-var next-parcel-id uint u1)
+
+;; Registry functions
+(define-public (register-parcel (property-id (string-ascii 128)) 
+                               (coordinates {lat: int, lng: int})
+                               (parcel-id (string-ascii 64)))
+  (let ((existing (map-get? parcel-registry {property-id: property-id})))
+    (if (is-some existing)
+        ERR-ALREADY-EXISTS
+        (begin
+          (map-set parcel-registry 
+            {property-id: property-id}
+            {
+              escrow-contract: none,
+              status: "available",
+              owner: tx-sender,
+              last-updated: block-height,
+              coordinates: coordinates,
+              parcel-id: parcel-id
+            }
+          )
+          (ok true)
+        )
+    )
+  )
+)
+
+(define-public (set-escrow-contract (property-id (string-ascii 128)) 
+                                   (escrow-contract principal))
+  (let ((parcel-data (map-get? parcel-registry {property-id: property-id})))
+    (match parcel-data
+      parcel (if (is-eq (get owner parcel) tx-sender)
+                 (begin
+                   (map-set parcel-registry
+                     {property-id: property-id}
+                     (merge parcel {
+                       escrow-contract: (some escrow-contract),
+                       status: "in-escrow",
+                       last-updated: block-height
+                     })
+                   )
+                   (ok true)
+                 )
+                 ERR-UNAUTHORIZED)
+      ERR-NOT-FOUND
+    )
+  )
+)
+
+(define-public (clear-escrow-contract (property-id (string-ascii 128)))
+  (let ((parcel-data (map-get? parcel-registry {property-id: property-id})))
+    (match parcel-data
+      parcel (if (is-eq (get owner parcel) tx-sender)
+                 (begin
+                   (map-set parcel-registry
+                     {property-id: property-id}
+                     (merge parcel {
+                       escrow-contract: none,
+                       status: "available",
+                       last-updated: block-height
+                     })
+                   )
+                   (ok true)
+                 )
+                 ERR-UNAUTHORIZED)
+      ERR-NOT-FOUND
+    )
+  )
+)
+
+(define-public (transfer-ownership (property-id (string-ascii 128))
+                                  (new-owner principal))
+  (let ((parcel-data (map-get? parcel-registry {property-id: property-id})))
+    (match parcel-data
+      parcel (if (is-eq (get owner parcel) tx-sender)
+                 (begin
+                   (map-set parcel-registry
+                     {property-id: property-id}
+                     (merge parcel {
+                       owner: new-owner,
+                       escrow-contract: none,
+                       status: "available",
+                       last-updated: block-height
+                     })
+                   )
+                   (ok true)
+                 )
+                 ERR-UNAUTHORIZED)
+      ERR-NOT-FOUND
+    )
+  )
+)
+
+;; Read-only functions
+(define-read-only (get-parcel-info (property-id (string-ascii 128)))
+  (map-get? parcel-registry {property-id: property-id})
+)
+
+(define-read-only (is-escrow-active (property-id (string-ascii 128)))
+  (let ((parcel-data (get-parcel-info property-id)))
+    (match parcel-data
+      parcel (is-some (get escrow-contract parcel))
+      false
+    )
+  )
+)
+
+(define-read-only (get-escrow-contract (property-id (string-ascii 128)))
+  (let ((parcel-data (get-parcel-info property-id)))
+    (match parcel-data
+      parcel (get escrow-contract parcel)
+      none
+    )
+  )
+)
+
+;; =============================================================================
+;; REAL ESTATE ESCROW CONTRACT WITH MULTI-CURRENCY SUPPORT
+;; =============================================================================
+
+(define-constant ERR-ESCROW-NOT-FOUND (err u200))
+(define-constant ERR-INVALID-BUYER (err u201))
+(define-constant ERR-INVALID-SELLER (err u202))
+(define-constant ERR-INSUFFICIENT-FUNDS (err u203))
+(define-constant ERR-ESCROW-EXPIRED (err u204))
+(define-constant ERR-ESCROW-NOT-EXPIRED (err u205))
+(define-constant ERR-INVALID-STATE (err u206))
+(define-constant ERR-ALREADY-COMPLETED (err u207))
+(define-constant ERR-INVALID-CURRENCY (err u208))
+(define-constant ERR-TRANSFER-FAILED (err u209))
+(define-constant ERR-INVALID-AMOUNT (err u210))
+
+;; Escrow states
+(define-constant STATE-PENDING "pending")
+(define-constant STATE-FUNDED "funded")
+(define-constant STATE-COMPLETED "completed")
+(define-constant STATE-CANCELLED "cancelled")
+(define-constant STATE-EXPIRED "expired")
+
+;; Registry contract reference
+(define-constant REGISTRY-CONTRACT .real-estate-registry)
+
+;; Escrow data
+(define-map escrows
+  uint
+  {
+    property-id: (string-ascii 128),
+    buyer: principal,
+    seller: principal,
+    purchase-price: uint,
+    earnest-money: uint,
+    state: (string-ascii 32),
+    creation-height: uint,
+    expiry-height: uint,
+    conditions: (list 10 (string-ascii 128)),
+    conditions-met: (list 10 bool),
+    buyer-signature: bool,
+    seller-signature: bool
+  }
+)
+
+(define-data-var next-escrow-id uint u1)
+
+(define-public (create-escrow (property-id (string-ascii 128))
+                             (seller principal)
+                             (purchase-price uint)
+                             (earnest-money uint)
+                             (duration-blocks uint)
+                             (conditions (list 10 (string-ascii 128)))
+                             (currency (string-ascii 10)))
+  (let ((escrow-id (var-get next-escrow-id))
+        (expiry-height (+ block-height duration-blocks))
+        (currency-contract (get-currency-contract currency)))
+    
+    ;; Validate currency
+    (asserts! (or (is-eq currency CURRENCY-STX)
+                  (is-eq currency CURRENCY-SBTC)
+                  (is-eq currency CURRENCY-USDH)) ERR-INVALID-CURRENCY)
+    
+    ;; Check if property is already in escrow
+    (match (contract-call? REGISTRY-CONTRACT get-escrow-contract property-id)
+      existing-escrow (if (is-some existing-escrow)
+                         ERR-ESCROW-ACTIVE
+                         (begin
+                           ;; Create escrow entry
+                           (map-set escrows
+                             escrow-id
+                             {
+                               property-id: property-id,
+                               buyer: tx-sender,
+                               seller: seller,
+                               purchase-price: purchase-price,
+                               earnest-money: earnest-money,
+                               currency: currency,
+                               state: STATE-PENDING,
+                               creation-height: block-height,
+                               expiry-height: expiry-height,
+                               conditions: conditions,
+                               conditions-met: (list false false false false false false false false false false),
+                               buyer-signature: false,
+                               seller-signature: false,
+                               funds-deposited: u0,
+                               currency-contract: currency-contract
+                             }
+                           )
+                           
+                           ;; Register escrow with registry
+                           (try! (contract-call? REGISTRY-CONTRACT set-escrow-contract 
+                                                property-id 
+                                                (as-contract tx-sender)))
+                           
+                           ;; Update counter
+                           (var-set next-escrow-id (+ escrow-id u1))
+                           
+                           (ok escrow-id)
+                         ))
+      ERR-NOT-FOUND
+    )
+  )
+)
+
+;; Helper function to get currency contract
+(define-read-only (get-currency-contract (currency (string-ascii 10)))
+  (if (is-eq currency CURRENCY-STX)
+      none
+      (if (is-eq currency CURRENCY-SBTC)
+          (some SBTC-CONTRACT)
+          (if (is-eq currency CURRENCY-USDH)
+              (some USDH-CONTRACT)
+              none))))
+
+(define-public (fund-escrow (escrow-id uint))
+  (let ((escrow-data (unwrap! (map-get? escrows escrow-id) ERR-ESCROW-NOT-FOUND)))
+    (asserts! (is-eq (get buyer escrow-data) tx-sender) ERR-INVALID-BUYER)
+    (asserts! (is-eq (get state escrow-data) STATE-PENDING) ERR-INVALID-STATE)
+    (asserts! (< block-height (get expiry-height escrow-data)) ERR-ESCROW-EXPIRED)
+    
+    (let ((amount (get earnest-money escrow-data))
+          (currency (get currency escrow-data)))
+      
+      ;; Handle different currency transfers
+      (if (is-eq currency CURRENCY-STX)
+          ;; STX transfer
+          (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+          ;; SIP-010 token transfer
+          (let ((token-contract (unwrap! (get currency-contract escrow-data) ERR-INVALID-CURRENCY)))
+            (try! (contract-call? token-contract transfer 
+                                 amount 
+                                 tx-sender 
+                                 (as-contract tx-sender) 
+                                 none))))
+      
+      ;; Update escrow state
+      (map-set escrows
+        escrow-id
+        (merge escrow-data {
+          state: STATE-FUNDED,
+          funds-deposited: amount
+        }))
+      (ok true))))
+
+(define-public (complete-escrow (escrow-id uint))
+  (let ((escrow-data (unwrap! (map-get? escrows escrow-id) ERR-ESCROW-NOT-FOUND)))
+    (asserts! (is-eq (get state escrow-data) STATE-FUNDED) ERR-INVALID-STATE)
+    (asserts! (get buyer-signature escrow-data) ERR-INVALID-STATE)
+    (asserts! (get seller-signature escrow-data) ERR-INVALID-STATE)
+    
+    (let ((total-amount (get purchase-price escrow-data))
+          (currency (get currency escrow-data))
+          (seller (get seller escrow-data)))
+      
+      ;; Transfer full purchase amount to seller
+      (if (is-eq currency CURRENCY-STX)
+          ;; STX transfer
+          (try! (as-contract (stx-transfer? total-amount tx-sender seller)))
+          ;; SIP-010 token transfer
+          (let ((token-contract (unwrap! (get currency-contract escrow-data) ERR-INVALID-CURRENCY)))
+            (try! (as-contract (contract-call? token-contract transfer 
+                                              total-amount 
+                                              tx-sender 
+                                              seller 
+                                              none)))))
+      
+      ;; Transfer property ownership
+      (try! (contract-call? REGISTRY-CONTRACT transfer-ownership 
+                           (get property-id escrow-data)
+                           (get buyer escrow-data)))
+      
+      ;; Clear escrow from registry
+      (try! (contract-call? REGISTRY-CONTRACT clear-escrow-contract 
+                           (get property-id escrow-data)))
+      
+      ;; Update escrow state
+      (map-set escrows
+        escrow-id
+        (merge escrow-data {state: STATE-COMPLETED}))
+      
+      (ok true))))
+
+(define-public (refund-escrow (escrow-id uint))
+  (let ((escrow-data (unwrap! (map-get? escrows escrow-id) ERR-ESCROW-NOT-FOUND)))
+    (asserts! (or (is-eq tx-sender (get buyer escrow-data))
+                  (is-eq tx-sender (get seller escrow-data))
+                  (> block-height (get expiry-height escrow-data))) ERR-UNAUTHORIZED)
+    
+    (let ((refund-amount (get funds-deposited escrow-data))
+          (currency (get currency escrow-data))
+          (buyer (get buyer escrow-data)))
+      
+      ;; Refund deposited funds to buyer
+      (if (> refund-amount u0)
+          (if (is-eq currency CURRENCY-STX)
+              ;; STX refund
+              (try! (as-contract (stx-transfer? refund-amount tx-sender buyer)))
+              ;; SIP-010 token refund
+              (let ((token-contract (unwrap! (get currency-contract escrow-data) ERR-INVALID-CURRENCY)))
+                (try! (as-contract (contract-call? token-contract transfer 
+                                                  refund-amount 
+                                                  tx-sender 
+                                                  buyer 
+                                                  none)))))
+          true)
+      
+      ;; Clear escrow from registry
+      (try! (contract-call? REGISTRY-CONTRACT clear-escrow-contract 
+                           (get property-id escrow-data)))
+      
+      ;; Update escrow state
+      (map-set escrows
+        escrow-id
+        (merge escrow-data {
+          state: (if (> block-height (get expiry-height escrow-data))
+                    STATE-EXPIRED
+                    STATE-CANCELLED)
+        }))
+      
+      (ok true))))
+
+;; Enhanced read-only functions for multi-currency support
+(define-read-only (get-escrow (escrow-id uint))
+  (map-get? escrows escrow-id))
+
+(define-read-only (get-escrow-currency (escrow-id uint))
+  (match (map-get? escrows escrow-id)
+    escrow-data (ok (get currency escrow-data))
+    ERR-ESCROW-NOT-FOUND))
+
+(define-read-only (get-supported-currencies)
+  (ok (list CURRENCY-STX CURRENCY-SBTC CURRENCY-USDH)))
+
+(define-read-only (get-currency-info (currency (string-ascii 10)))
+  (ok {
+    currency: currency,
+    contract: (get-currency-contract currency),
+    is-native: (is-eq currency CURRENCY-STX)
+  }))
+
+(define-public (sign-escrow (escrow-id uint))
+  (let ((escrow-data (unwrap! (map-get? escrows escrow-id) ERR-ESCROW-NOT-FOUND)))
+    (cond
+      ((is-eq tx-sender (get buyer escrow-data))
+       (map-set escrows
+         escrow-id
+         (merge escrow-data {buyer-signature: true}))
+       (ok true))
+      ((is-eq tx-sender (get seller escrow-data))
+       (map-set escrows
+         escrow-id
+         (merge escrow-data {seller-signature: true}))
+       (ok true))
+      (else ERR-UNAUTHORIZED))))
+
+(define-public (mark-condition-met (escrow-id uint) (condition-index uint))
+  (let ((escrow-data (unwrap! (map-get? escrows escrow-id) ERR-ESCROW-NOT-FOUND)))
+    (if (or (is-eq tx-sender (get buyer escrow-data))
+            (is-eq tx-sender (get seller escrow-data)))
+        (begin
+          ;; In a full implementation, update the conditions-met list
+          ;; This is simplified for demo purposes
+          (ok true))
+        ERR-UNAUTHORIZED)))
+
+;; Read-only functions
+(define-read-only (get-escrow (escrow-id uint))
+  (map-get? escrows escrow-id))
+
+(define-read-only (get-escrow-by-property (property-id (string-ascii 128)))
+  (let ((escrow-contract (unwrap! (contract-call? REGISTRY-CONTRACT get-escrow-contract property-id) (err u0))))
+    (if (is-eq escrow-contract (as-contract tx-sender))
+        ;; In full implementation, search for escrow by property-id
+        (some u1) ;; Placeholder
+        none)))
+
+(define-read-only (get-next-escrow-id)
+  (var-get next-escrow-id))
+
+;; =============================================================================
+;; REAL ESTATE PARCEL NFT CONTRACT (SIP-009 Implementation)
+;; =============================================================================
+
+(define-constant ERR-NOT-AUTHORIZED (err u401))
+(define-constant ERR-NOT-FOUND (err u404))
+(define-constant ERR-ALREADY-EXISTS (err u409))
+
+(define-fungible-token real-estate-parcel)
+
+(define-non-fungible-token real-estate-parcel uint)
+
+(define-data-var last-token-id uint u0)
+(define-data-var token-uri (string-ascii 256) "https://api.realestate.stacks/metadata/{id}")
+
+(define-map token-parcel-data
+  uint
+  {
+    coordinates: {lat: int, lng: int},
+    parcel-id: (string-ascii 64),
+    legal-description: (string-ascii 512),
+    assessed-value: uint,
+    property-type: (string-ascii 32),
+    zoning: (string-ascii 16),
+    square-footage: uint,
+    creation-height: uint
+  }
+)
+
+;; SIP-009 Functions
+(define-public (transfer (id uint) (sender principal) (recipient principal))
+  (begin
+    (asserts! (or (is-eq tx-sender sender)
+                  (is-eq contract-caller sender)) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (unwrap! (nft-get-owner? real-estate-parcel id) ERR-NOT-FOUND) sender) ERR-NOT-AUTHORIZED)
+    (nft-transfer? real-estate-parcel id sender recipient)))
+
+(define-read-only (get-owner (id uint))
+  (ok (nft-get-owner? real-estate-parcel id)))
+
+(define-read-only (get-last-token-id)
+  (ok (var-get last-token-id)))
+
+(define-read-only (get-token-uri (id uint))
+  (ok (some (var-get token-uri))))
+
+;; Parcel-specific functions
+(define-public (mint-parcel (recipient principal)
+                           (coordinates {lat: int, lng: int})
+                           (parcel-id (string-ascii 64))
+                           (legal-description (string-ascii 512))
+                           (assessed-value uint)
+                           (property-type (string-ascii 32))
+                           (zoning (string-ascii 16))
+                           (square-footage uint))
+  (let ((token-id (+ (var-get last-token-id) u1)))
+    (try! (nft-mint? real-estate-parcel token-id recipient))
+    (map-set token-parcel-data
+      token-id
+      {
+        coordinates: coordinates,
+        parcel-id: parcel-id,
+        legal-description: legal-description,
+        assessed-value: assessed-value,
+        property-type: property-type,
+        zoning: zoning,
+        square-footage: square-footage,
+        creation-height: block-height
+      }
+    )
+    (var-set last-token-id token-id)
+    (ok token-id)))
+
+(define-read-only (get-parcel-data (token-id uint))
+  (ok (map-get? token-parcel-data token-id)))
+
+(define-public (update-parcel-data (token-id uint)
+                                  (new-data {
+                                    coordinates: {lat: int, lng: int},
+                                    parcel-id: (string-ascii 64),
+                                    legal-description: (string-ascii 512),
+                                    assessed-value: uint,
+                                    property-type: (string-ascii 32),
+                                    zoning: (string-ascii 16),
+                                    square-footage: uint
+                                  }))
+  (let ((owner (unwrap! (nft-get-owner? real-estate-parcel token-id) ERR-NOT-FOUND)))
+    (asserts! (is-eq tx-sender owner) ERR-NOT-AUTHORIZED)
+    (map-set token-parcel-data
+      token-id
+      (merge (unwrap! (map-get? token-parcel-data token-id) ERR-NOT-FOUND)
+             new-data))
+    (ok true)))
+
+;; =============================================================================
+;; ESCROW TRAIT IMPLEMENTATION (Updated for multi-currency)
+;; =============================================================================
+
+(define-trait escrow-trait
+  (
+    ;; Core escrow functions with currency support
+    (create-escrow ((string-ascii 128) principal uint uint uint (list 10 (string-ascii 128)) (string-ascii 10)) (response uint uint))
+    (fund-escrow (uint) (response bool uint))
+    (complete-escrow (uint) (response bool uint))
+    (refund-escrow (uint) (response bool uint))
+    (sign-escrow (uint) (response bool uint))
+    
+    ;; Condition management
+    (mark-condition-met (uint uint) (response bool uint))
+    
+    ;; Multi-currency read-only functions
+    (get-escrow (uint) (response (optional {
+      property-id: (string-ascii 128),
+      buyer: principal,
+      seller: principal,
+      purchase-price: uint,
+      earnest-money: uint,
+      currency: (string-ascii 10),
+      state: (string-ascii 32),
+      creation-height: uint,
+      expiry-height: uint,
+      conditions: (list 10 (string-ascii 128)),
+      conditions-met: (list 10 bool),
+      buyer-signature: bool,
+      seller-signature: bool,
+      funds-deposited: uint,
+      currency-contract: (optional principal)
+    }) uint))
+    (get-escrow-by-property ((string-ascii 128)) (response (optional uint) uint))
+    (get-escrow-currency (uint) (response (string-ascii 10) uint))
+    (get-supported-currencies () (response (list 10 (string-ascii 10)) uint))
+  )
+)
+
+;; Implementation verification
+(impl-trait .escrow-trait)
+
+;; =============================================================================
+;; DEPLOYMENT AND INITIALIZATION
+;; =============================================================================
+
+;; Initialize contract with basic data
+(begin
+  ;; Set initial values
+  (var-set next-escrow-id u1)
+  (var-set last-token-id u0)
+  
+  ;; Contract is ready for use
+  (print "Real Estate Settlement contracts deployed successfully")
+  (print {
+    registry-contract: "real-estate-registry",
+    escrow-contract: "real-estate-escrow", 
+    nft-contract: "real-estate-parcel",
+    network: "stacks-testnet"
+  })
+) 
