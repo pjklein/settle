@@ -50,8 +50,8 @@ A decentralized application for real estate settlement using Stacks blockchain a
 
 1. Clone the repository
 ```bash
-git clone https://github.com/your-org/real-estate-settlement-dapp.git
-cd real-estate-settlement-dapp
+git clone https://github.com/pjklein/settle.git
+cd settle
 ```
 
 2. Install dependencies
